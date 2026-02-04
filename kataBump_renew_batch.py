@@ -33,6 +33,30 @@ SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
+def mask_email_keep_domain(email: str) -> str:
+    """
+    只脱敏 @ 前面的用户名：
+    - 保留第 1 个和最后 1 个字符
+    - 中间有几个字符就用几个 *（星号数量 = 中间字符数量）
+    - @ 后面的域名原样保留
+    例：abcdef@gmail.com -> a****f@gmail.com
+    """
+    e = (email or "").strip()
+    if "@" not in e:
+        return "***"
+
+    name, domain = e.split("@", 1)
+    if len(name) <= 1:
+        name_mask = name or "*"
+    elif len(name) == 2:
+        # 中间字符数为0，所以不加 *
+        name_mask = name[0] + name[1]
+    else:
+        name_mask = name[0] + ("*" * (len(name) - 2)) + name[-1]
+
+    return f"{name_mask}@{domain}"
+
+
 def setup_xvfb():
     """在 Linux 上启动 Xvfb（无 DISPLAY 时）"""
     if platform.system().lower() == "linux" and not os.environ.get("DISPLAY"):
@@ -166,7 +190,7 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         sb.uc_open_with_reconnect(renew_url, reconnect_time=5.0)
         sb.wait_for_element_visible("body", timeout=30)
         time.sleep(2)
-        screenshot(sb, f"id_{server_id}_01_page_loaded.png")
+        # screenshot(sb, f"id_{server_id}_01_page_loaded.png")
 
         # ===== 获取 Expiry 并检查是否需要续期 =====
         expiry_before = get_expiry(sb)
@@ -182,7 +206,7 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         sb.click("button:contains('Renew')")
         sb.wait_for_element_visible("#renew-modal", timeout=20)
         time.sleep(2)
-        screenshot(sb, f"id_{server_id}_02_modal_open.png")
+        # screenshot(sb, f"id_{server_id}_02_modal_open.png")
 
         # ===== 尝试 Turnstile 交互 =====
         try:
@@ -191,7 +215,7 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         except Exception as e:
             print(f"⚠️ captcha 点击异常: {e}")
 
-        screenshot(sb, f"id_{server_id}_03_after_captcha.png")
+        # screenshot(sb, f"id_{server_id}_03_after_captcha.png")
 
         # ===== 检查 cookies =====
         cookies = sb.get_cookies()
@@ -199,14 +223,14 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         print("🧩 cf_clearance:", "OK" if cf_clearance else "NONE")
 
         if not cf_clearance:
-            screenshot(sb, f"id_{server_id}_04_no_cf_clearance.png")
+            # screenshot(sb, f"id_{server_id}_04_no_cf_clearance.png")
             print("❌ 未获取 cf_clearance，续期可能失败")
             return "FAIL", expiry_before, None
 
         # ===== 提交 Renew =====
         sb.execute_script("document.querySelector('#renew-modal form').submit();")
         time.sleep(3)
-        screenshot(sb, f"id_{server_id}_05_after_submit.png")
+        # screenshot(sb, f"id_{server_id}_05_after_submit.png")
 
         # ===== 尝试刷新并再次读取 Expiry（不保证立即变，但尽量验证一下）=====
         try:
@@ -242,8 +266,12 @@ def main():
             if tg_token and tg_chat:
                 tg_dests.add((tg_token, tg_chat))
 
+            
+
+            email = acc["email"]
+            safe_email = mask_email_keep_domain(email)
             print("\n" + "=" * 70)
-            print(f"👤 [{i}/{len(accounts)}] 账号：  {email} | server_id={server_id}")
+            print(f"👤 [{i}/{len(accounts)}] 账号： {safe_email}")
             print("=" * 70)
 
             try:
@@ -251,23 +279,23 @@ def main():
 
                 if status == "SKIP":
                     skip += 1
-                    msg = f"ℹ️ Katabump 续期跳过（未到期前一天）\n账号：{email}\nServer ID：{server_id}\nExpiry：{before}"
+                    msg = f"ℹ️ Katabump 续期跳过（未到期前一天）\n账号：{safe_email}\nExpiry：{before}"
                 elif status == "OK":
                     ok += 1
                     if after and after != before:
-                        msg = f"✅ Katabump 续期成功\n账号：{email}\nServer ID：{server_id}\nExpiry：{before} ➜ {after}"
+                        msg = f"✅ Katabump 续期成功\n账号：{safe_email}\nExpiry：{before} ➜ {after}"
                     else:
-                        msg = f"✅ Katabump 已提交续期（Expiry 可能稍后更新）\n账号：{email}\nServer ID：{server_id}\nExpiry：{before}"
+                        msg = f"✅ Katabump 已提交续期（Expiry 可能稍后更新）\n账号：{safe_email}\nExpiry：{before}"
                 else:
                     fail += 1
-                    msg = f"❌ Katabump 续期失败/疑似失败\n账号：{email}\nServer ID：{server_id}\nExpiry：{before or '未知'}"
+                    msg = f"❌ Katabump 续期失败/疑似失败\n账号：{safe_email}\nExpiry：{before or '未知'}"
 
                 print(msg)
                 tg_send(msg, tg_token, tg_chat)
 
             except Exception as e:
                 fail += 1
-                msg = f"❌ Katabump 脚本异常\n账号：{email}\nServer ID：{server_id}\n错误：{e}"
+                msg = f"❌ Katabump 脚本异常\n账号：{safe_email}\n错误：{e}"
                 print(msg)
                 tg_send(msg, tg_token, tg_chat)
 
