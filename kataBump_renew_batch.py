@@ -1,7 +1,8 @@
 import os
 import platform
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import re
 from typing import List, Dict, Optional, Tuple
 
 import requests
@@ -99,16 +100,29 @@ def get_expiry(sb) -> str:
     return sb.get_text("//div[contains(text(),'Expiry')]/following-sibling::div").strip()
 
 
-def parse_expiry_date(expiry_str: str) -> datetime:
-    """把 Expiry 字符串解析为 datetime（YYYY-MM-DD）"""
-    return datetime.strptime(expiry_str, "%Y-%m-%d")
 
+def should_renew_utc0(expiry_str: str, now_utc: datetime = None) -> bool:
+    """
+    以 UTC 0 点作为对比基准，精确到小时分钟：
+    - expiry_str: 'YYYY-MM-DD'（页面显示的到期日）
+    - 可续期开放时间：expiry_date 的前一天 00:00 UTC
+    """
+    expiry_date = datetime.strptime(expiry_str.strip(), "%Y-%m-%d").date()
+    renew_open_utc = datetime(expiry_date.year, expiry_date.month, expiry_date.day, tzinfo=timezone.utc) - timedelta(days=1)
 
-def should_renew(expiry_str: str) -> bool:
-    """判断是否到续期时间（到期前一天）"""
-    expiry_date = parse_expiry_date(expiry_str)
-    today = datetime.today()
-    return (expiry_date - today).days == 1
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    print(f"🕒 now_utc        = {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"🕒 renew_open_utc = {renew_open_utc.strftime('%Y-%m-%d %H:%M')} UTC")
+
+    if now_utc >= renew_open_utc:
+        return True
+
+    delta = renew_open_utc - now_utc
+    mins = int(delta.total_seconds() // 60)
+    print(f"⏳ 距离可续期还差: {mins//60} 小时 {mins%60} 分钟（按 UTC0 点）")
+    return False
+
 
 
 def build_accounts_from_env() -> List[Dict[str, str]]:
@@ -171,6 +185,7 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
       - "SKIP"  还没到续期时间
       - "OK"    已提交续期且 Expiry 有变化（或提交后可见更新）
       - "FAIL"  续期流程中断/疑似失败
+      - OK_NOT_YET: alert_text
     """
     renew_url = RENEW_URL_TEMPLATE.format(server_id=server_id)
 
@@ -196,8 +211,8 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         expiry_before = get_expiry(sb)
         print(f"📅 当前 Expiry: {expiry_before}")
 
-        if not should_renew(expiry_before):
-            print("ℹ️ 还没到续期时间，今天不续期")
+        if not should_renew_utc0(expiry_before):
+            print("ℹ️ 还没到续期时间（按 UTC0 点规则），今天不续期")
             return "SKIP", expiry_before, None
 
         print("🔔 到续期时间，开始续期流程...")
@@ -231,6 +246,30 @@ def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, O
         sb.execute_script("document.querySelector('#renew-modal form').submit();")
         time.sleep(3)
         # screenshot(sb, f"id_{server_id}_05_after_submit.png")
+        # ===== 严格识别“未到续期时间”的告警：算【任务成功】 =====
+        NOT_YET_SEL = 'div.alert.alert-danger.alert-dismissible.fade.show[role="alert"]'
+
+        if sb.is_element_visible(NOT_YET_SEL):
+            alert_text_raw = (sb.get_text(NOT_YET_SEL) or "").strip()
+
+            # 用清洗后的文本做匹配（更稳），但输出/返回用原文 raw
+            alert_text_clean = alert_text_raw.replace("×", " ")
+            alert_text_clean = re.sub(r"\s+", " ", alert_text_clean).strip()
+
+            pattern = re.compile(
+                r"You can't renew your server yet\.\s*You will be able to as of\s+\d{1,2}\s+[A-Za-z]+\s+\(in\s+\d+\s+day\(s\)\)\.?",
+                re.IGNORECASE
+            )
+
+            if pattern.search(alert_text_clean):
+                print(f"🔎 未到续期时间告警（按网站规则）：[{alert_text_raw}]")
+                return "OK_NOT_YET", expiry_before, alert_text_raw
+
+            print(f"❌ 续期失败告警（非未到期提示）：[{alert_text_raw}]")
+            return "FAIL", expiry_before, alert_text_raw
+
+
+
 
         # ===== 尝试刷新并再次读取 Expiry（不保证立即变，但尽量验证一下）=====
         try:
@@ -268,7 +307,6 @@ def main():
 
             
 
-            email = acc["email"]
             safe_email = mask_email_keep_domain(email)
             print("\n" + "=" * 70)
             print(f"👤 [{i}/{len(accounts)}] 账号： {safe_email}")
@@ -286,6 +324,14 @@ def main():
                         msg = f"✅ Katabump 续期成功\n账号：{safe_email}\nExpiry：{before} ➜ {after}"
                     else:
                         msg = f"✅ Katabump 已提交续期（Expiry 可能稍后更新）\n账号：{safe_email}\nExpiry：{before}"
+                elif status == "OK_NOT_YET":
+                    ok += 1
+                    msg = (
+                        "✅ Katabump 监测到『未到续期时间』提示（脚本正常）\n"
+                        f"账号：{safe_email}\n"
+                        f"Expiry：{before}\n"
+                        f"告警：{after}"
+                    )
                 else:
                     fail += 1
                     msg = f"❌ Katabump 续期失败/疑似失败\n账号：{safe_email}\nExpiry：{before or '未知'}"
@@ -299,8 +345,6 @@ def main():
                 print(msg)
                 tg_send(msg, tg_token, tg_chat)
 
-            # 切下一个账号前等待 5 秒
-            time.sleep(5)
 
             # 每个账号之间等待 5 秒，避免触发风控/频繁登录
             if i < len(accounts):
