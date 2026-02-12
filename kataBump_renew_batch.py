@@ -3,6 +3,7 @@ import platform
 import time
 from datetime import datetime, timedelta, timezone
 import re
+import traceback
 from typing import List, Dict, Optional, Tuple
 
 import requests
@@ -24,7 +25,6 @@ export KATABUMP_BATCH='a1@example.com,pass1,218445,123456:AAxxxxxx,123456789
 a2@example.com,pass2,998877,123456:AAyyyyyy,-10022223333
 a3@example.com,pass3,556677
 '
-
 """
 
 LOGIN_URL = "https://dashboard.katabump.com/login"
@@ -36,11 +36,7 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 def mask_email_keep_domain(email: str) -> str:
     """
-    只脱敏 @ 前面的用户名：
-    - 保留第 1 个和最后 1 个字符
-    - 中间有几个字符就用几个 *（星号数量 = 中间字符数量）
-    - @ 后面的域名原样保留
-    例：abcdef@gmail.com -> a****f@gmail.com
+    只脱敏 @ 前面的用户名
     """
     e = (email or "").strip()
     if "@" not in e:
@@ -50,7 +46,6 @@ def mask_email_keep_domain(email: str) -> str:
     if len(name) <= 1:
         name_mask = name or "*"
     elif len(name) == 2:
-        # 中间字符数为0，所以不加 *
         name_mask = name[0] + name[1]
     else:
         name_mask = name[0] + ("*" * (len(name) - 2)) + name[-1]
@@ -61,23 +56,29 @@ def mask_email_keep_domain(email: str) -> str:
 def setup_xvfb():
     """在 Linux 上启动 Xvfb（无 DISPLAY 时）"""
     if platform.system().lower() == "linux" and not os.environ.get("DISPLAY"):
-        display = Display(visible=False, size=(1920, 1080))
-        display.start()
-        os.environ["DISPLAY"] = display.new_display_var
-        print("🖥️ Xvfb 已启动")
-        return display
+        try:
+            display = Display(visible=False, size=(1920, 1080))
+            display.start()
+            os.environ["DISPLAY"] = display.new_display_var
+            print("🖥️ Xvfb 已启动")
+            return display
+        except Exception as e:
+            print(f"⚠️ 启动 Xvfb 失败 (非致命): {e}")
     return None
 
 
 def screenshot(sb, name: str):
     """保存截图"""
-    path = f"{SCREENSHOT_DIR}/{name}"
-    sb.save_screenshot(path)
-    print(f"📸 {path}")
+    try:
+        path = f"{SCREENSHOT_DIR}/{name}"
+        sb.save_screenshot(path)
+        print(f"📸 截图已保存: {path}")
+    except Exception as e:
+        print(f"⚠️ 截图失败: {e}")
 
 
 def tg_send(text: str, token: Optional[str] = None, chat_id: Optional[str] = None):
-    """发送 Telegram 消息（每个账号独立 token/chat_id；不配置则跳过）"""
+    """发送 Telegram 消息"""
     token = (token or "").strip()
     chat_id = (chat_id or "").strip()
     if not token or not chat_id:
@@ -91,29 +92,46 @@ def tg_send(text: str, token: Optional[str] = None, chat_id: Optional[str] = Non
             timeout=15,
         ).raise_for_status()
     except Exception as e:
-        # TG 失败不影响主流程
         print(f"⚠️ TG 发送失败：{e}")
 
 
-def get_expiry(sb) -> str:
-    """获取服务器 Expiry 字符串（页面上通常是 YYYY-MM-DD）"""
-    return sb.get_text("//div[contains(text(),'Expiry')]/following-sibling::div").strip()
+def get_expiry(sb) -> Optional[str]:
+    """
+    安全获取服务器 Expiry 字符串
+    """
+    try:
+        # 先检查是否存在
+        if sb.is_element_visible("//div[contains(text(),'Expiry')]"):
+            text = sb.get_text("//div[contains(text(),'Expiry')]/following-sibling::div")
+            return text.strip() if text else None
+    except Exception:
+        pass
+    return None
 
 
 def renew_open_utc_from_expiry(expiry_str: str) -> datetime:
-    d = datetime.strptime(expiry_str.strip(), "%Y-%m-%d").date()
-    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc) - timedelta(days=1)
+    try:
+        d = datetime.strptime(expiry_str.strip(), "%Y-%m-%d").date()
+        return datetime(d.year, d.month, d.day, tzinfo=timezone.utc) - timedelta(days=1)
+    except ValueError:
+        # 如果格式不对，返回一个默认时间
+        return datetime.now(timezone.utc)
 
 
 def should_renew_utc0(expiry_str: str, now_utc: datetime = None) -> bool:
     """
-    以 UTC 0 点作为对比基准，精确到小时分钟：
-    - expiry_str: 'YYYY-MM-DD'（页面显示的到期日）
-    - 可续期开放时间：expiry_date 的前一天 00:00 UTC
+    以 UTC 0 点作为对比基准
     """
-    expiry_date = datetime.strptime(expiry_str.strip(), "%Y-%m-%d").date()
-    renew_open_utc = datetime(expiry_date.year, expiry_date.month, expiry_date.day, tzinfo=timezone.utc) - timedelta(days=1)
+    if not expiry_str:
+        return False
+        
+    try:
+        expiry_date = datetime.strptime(expiry_str.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        print(f"⚠️ 日期格式解析错误: {expiry_str}")
+        return False
 
+    renew_open_utc = datetime(expiry_date.year, expiry_date.month, expiry_date.day, tzinfo=timezone.utc) - timedelta(days=1)
     now_utc = now_utc or datetime.now(timezone.utc)
 
     print(f"🕒 now_utc        = {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
@@ -128,23 +146,10 @@ def should_renew_utc0(expiry_str: str, now_utc: datetime = None) -> bool:
     return False
 
 
-
 def build_accounts_from_env() -> List[Dict[str, str]]:
-    """
-    统一账号来源：只使用 KATABUMP_BATCH（多行，每行一个账号）。
-
-    格式（仅支持逗号分隔）：
-      1) email,password,server_id
-      2) email,password,server_id,tg_bot_token,tg_chat_id   （可选：为该账号单独指定 TG）
-
-    规则：
-      - 行首/行尾空格会被忽略
-      - 空行与 # 开头注释行会被忽略
-      - 不写 TG 就不发 TG（不会回退任何全局 TG 变量）
-    """
     batch = (os.getenv("KATABUMP_BATCH") or "").strip()
     if not batch:
-        raise RuntimeError("❌ 缺少环境变量：请设置 KATABUMP_BATCH（即使只有一个账号也用它）")
+        raise RuntimeError("❌ 缺少环境变量：请设置 KATABUMP_BATCH")
 
     accounts: List[Dict[str, str]] = []
     for idx, raw in enumerate(batch.splitlines(), start=1):
@@ -155,16 +160,16 @@ def build_accounts_from_env() -> List[Dict[str, str]]:
         parts = [p.strip() for p in line.split(",")]
 
         if len(parts) not in (3, 5):
-            raise RuntimeError(
-                f"❌ KATABUMP_BATCH 第 {idx} 行格式不对（必须是 email,password,server_id 或 email,password,server_id,tg_bot_token,tg_chat_id）：{raw!r}"
-            )
+            print(f"⚠️ 跳过格式错误的行 ({idx}): {raw}")
+            continue
 
         email, password, server_id = parts[0], parts[1], parts[2]
         tg_token = parts[3] if len(parts) == 5 else ""
         tg_chat = parts[4] if len(parts) == 5 else ""
 
         if not email or not password or not server_id:
-            raise RuntimeError(f"❌ KATABUMP_BATCH 第 {idx} 行存在空字段：{raw!r}")
+            print(f"⚠️ 跳过空字段行 ({idx}): {raw}")
+            continue
 
         accounts.append({
             "email": email,
@@ -175,130 +180,159 @@ def build_accounts_from_env() -> List[Dict[str, str]]:
         })
 
     if not accounts:
-        raise RuntimeError("❌ KATABUMP_BATCH 里没有有效账号行（空行/注释行不算）")
+        raise RuntimeError("❌ KATABUMP_BATCH 里没有有效账号行")
 
     return accounts
 
 
 def renew_one_account(email: str, password: str, server_id: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    续期单个账号。
-
-    返回：(status, expiry_before, expiry_after)
-    status:
-      - "SKIP"  还没到续期时间
-      - "OK"    已提交续期且 Expiry 有变化（或提交后可见更新）
-      - "FAIL"  续期流程中断/疑似失败
-      - OK_NOT_YET: alert_text
+    续期单个账号
+    返回：(status, expiry_before, expiry_after_or_msg)
     """
     renew_url = RENEW_URL_TEMPLATE.format(server_id=server_id)
+    expiry_before = None
 
-    with SB(uc=True, locale="en", test=True) as sb:
-        print("🚀 浏览器启动（UC Mode）")
+    try:
+        # 使用 uc=True 模式启动浏览器
+        with SB(uc=True, locale="en", test=True) as sb:
+            print("🚀 浏览器启动（UC Mode）")
 
-        # ===== 登录 =====
-        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5.0)
-        time.sleep(2)
-        sb.type('input[name="email"]', email)
-        sb.type('input[name="password"]', password)
-        sb.click('button[type="submit"]')
-        sb.wait_for_element_visible("body", timeout=30)
-        time.sleep(2)
+            # ===== 1. 登录流程 =====
+            print(f"👉 正在登录: {email} ...")
+            try:
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5.0)
+                time.sleep(3)
+                
+                # 检查是否还在登录页
+                if sb.is_element_visible('input[name="email"]'):
+                    sb.type('input[name="email"]', email)
+                    sb.type('input[name="password"]', password)
+                    
+                    # 尝试处理 Cloudflare 点击
+                    if sb.is_element_visible("iframe[src*='challenges']"):
+                         print("🧩 检测到 CF 验证码，尝试点击...")
+                         sb.uc_gui_click_captcha()
+                         time.sleep(2)
 
-        # ===== 打开续期页（关键：server_id 从环境变量/批量配置来）=====
-        sb.uc_open_with_reconnect(renew_url, reconnect_time=5.0)
-        sb.wait_for_element_visible("body", timeout=30)
-        time.sleep(2)
-        # screenshot(sb, f"id_{server_id}_01_page_loaded.png")
+                    sb.click('button[type="submit"]')
+                    sb.wait_for_element_visible("body", timeout=30)
+                    time.sleep(3)
+            except Exception as e:
+                print(f"⚠️ 登录过程出现异常: {e}")
+                # 不立即返回，尝试继续，也许已经登录了
 
-        # ===== 获取 Expiry 并检查是否需要续期 =====
-        expiry_before = get_expiry(sb)
-        print(f"📅 当前 Expiry: {expiry_before}")
+            # ===== 2. 检查登录状态 =====
+            if sb.is_element_visible('input[name="email"]'):
+                print("❌ 登录失败：页面依然在登录框。")
+                screenshot(sb, f"login_fail_{server_id}.png")
+                return "FAIL", None, "Login Failed (Page Stuck)"
 
-        if not should_renew_utc0(expiry_before):
-            print("ℹ️ 还没到续期时间（按 UTC0 点规则），今天不续期")
-            return "SKIP", expiry_before, None
-
-        print("🔔 到续期时间，开始续期流程...")
-
-        # ===== 打开 Renew Modal =====
-        sb.click("button:contains('Renew')")
-        sb.wait_for_element_visible("#renew-modal", timeout=20)
-        time.sleep(2)
-        # screenshot(sb, f"id_{server_id}_02_modal_open.png")
-
-        # ===== 尝试 Turnstile 交互 =====
-        try:
-            sb.uc_gui_click_captcha()
-            time.sleep(4)
-        except Exception as e:
-            print(f"⚠️ captcha 点击异常: {e}")
-
-        # screenshot(sb, f"id_{server_id}_03_after_captcha.png")
-
-        # ===== 检查 cookies =====
-        cookies = sb.get_cookies()
-        cf_clearance = next((c["value"] for c in cookies if c.get("name") == "cf_clearance"), None)
-        print("🧩 cf_clearance:", "OK" if cf_clearance else "NONE")
-
-        if not cf_clearance:
-            # screenshot(sb, f"id_{server_id}_04_no_cf_clearance.png")
-            print("❌ 未获取 cf_clearance，续期可能失败")
-            return "FAIL", expiry_before, None
-
-        # ===== 提交 Renew =====
-        sb.execute_script("document.querySelector('#renew-modal form').submit();")
-        time.sleep(3)
-        # screenshot(sb, f"id_{server_id}_05_after_submit.png")
-        # ===== 严格识别“未到续期时间”的告警：算【任务成功】 =====
-        NOT_YET_SEL = 'div.alert.alert-danger.alert-dismissible.fade.show[role="alert"]'
-
-        if sb.is_element_visible(NOT_YET_SEL):
-            alert_text_raw = (sb.get_text(NOT_YET_SEL) or "").strip()
-
-            # 用清洗后的文本做匹配（更稳），但输出/返回用原文 raw
-            alert_text_clean = alert_text_raw.replace("×", " ")
-            alert_text_clean = re.sub(r"\s+", " ", alert_text_clean).strip()
-
-            pattern = re.compile(
-                r"You can't renew your server yet\.\s*You will be able to as of\s+\d{1,2}\s+[A-Za-z]+\s+\(in\s+\d+\s+day\(s\)\)\.?",
-                re.IGNORECASE
-            )
-
-            if pattern.search(alert_text_clean):
-                print(f"🔎 未到续期时间告警（按网站规则）：[{alert_text_raw}]")
-                return "OK_NOT_YET", expiry_before, alert_text_raw
-
-            print(f"❌ 续期失败告警（非未到期提示）：[{alert_text_raw}]")
-            return "FAIL", expiry_before, alert_text_raw
-
-
-
-
-        # ===== 尝试刷新并再次读取 Expiry（不保证立即变，但尽量验证一下）=====
-        try:
-            sb.refresh()
+            # ===== 3. 进入服务器详情页 =====
+            print(f"👉 跳转到服务器页: {server_id} ...")
+            sb.uc_open_with_reconnect(renew_url, reconnect_time=5.0)
             sb.wait_for_element_visible("body", timeout=30)
-            time.sleep(2)
-            expiry_after = get_expiry(sb)
-        except Exception:
-            expiry_after = None
+            time.sleep(3)
 
-        if expiry_after and expiry_after != expiry_before:
-            print(f"🎉 Expiry 已更新：{expiry_before} -> {expiry_after}")
+            # 检查 404
+            if "404" in sb.get_page_title() or "not found" in (sb.get_text("body") or "").lower():
+                 print("❌ 页面 404：可能是 Server ID 错误。")
+                 return "FAIL", None, "Page 404"
+
+            # ===== 4. 获取当前 Expiry =====
+            expiry_before = get_expiry(sb)
+            
+            if not expiry_before:
+                print("❌ 未找到 Expiry 元素，可能登录失效或布局变更。")
+                screenshot(sb, f"no_expiry_{server_id}.png")
+                return "FAIL", None, "Expiry Element Not Found"
+
+            print(f"📅 当前 Expiry: {expiry_before}")
+
+            # 检查是否需要续期
+            if not should_renew_utc0(expiry_before):
+                print("ℹ️ 还没到续期时间（按 UTC0 点规则）")
+                return "SKIP", expiry_before, None
+
+            print("🔔 到续期时间，开始续期流程...")
+
+            # ===== 5. 点击 Renew 按钮 =====
+            if not sb.is_element_visible("button:contains('Renew')"):
+                print("❌ 找不到 Renew 按钮")
+                screenshot(sb, f"no_renew_btn_{server_id}.png")
+                return "FAIL", expiry_before, "No Renew Btn"
+
+            sb.click("button:contains('Renew')")
+            sb.wait_for_element_visible("#renew-modal", timeout=20)
+            time.sleep(2)
+
+            # ===== 6. 处理 Renew Modal 中的 Turnstile =====
+            print("🧩 检查 Modal 验证码...")
+            try:
+                # 尝试点击任何可能的验证码 iframe
+                if sb.is_element_visible("iframe[src*='challenges']"):
+                    sb.uc_gui_click_captcha()
+                    time.sleep(4)
+            except Exception as e:
+                print(f"⚠️ captcha 点击异常: {e}")
+
+            # ===== 7. 提交 Renew =====
+            # 使用 JS 强制提交，通常比点击 submit 按钮更稳
+            sb.execute_script("document.querySelector('#renew-modal form').submit();")
+            print("📤 已提交续期请求...")
+            
+            # 等待结果（页面可能会刷新或弹出提示）
+            time.sleep(5)
+
+            # ===== 8. 检查结果/告警 =====
+            NOT_YET_SEL = 'div.alert.alert-danger'
+            if sb.is_element_visible(NOT_YET_SEL):
+                alert_text_raw = (sb.get_text(NOT_YET_SEL) or "").strip()
+                print(f"🔎 网站返回告警: [{alert_text_raw}]")
+                screenshot(sb, f"renew_alert_{server_id}.png")
+
+                # 清洗文本以匹配“未到期”提示
+                clean_text = re.sub(r"\s+", " ", alert_text_raw).replace("×", "").strip()
+                if "renew your server yet" in clean_text.lower():
+                    return "OK_NOT_YET", expiry_before, alert_text_raw
+                
+                return "FAIL", expiry_before, alert_text_raw
+
+            # ===== 9. 刷新检查 Expiry 是否更新 =====
+            try:
+                sb.refresh()
+                sb.wait_for_element_visible("body", timeout=30)
+                time.sleep(3)
+                expiry_after = get_expiry(sb)
+            except Exception:
+                expiry_after = None
+
+            if expiry_after and expiry_after != expiry_before:
+                print(f"🎉 Expiry 已更新: {expiry_before} -> {expiry_after}")
+                return "OK", expiry_before, expiry_after
+
+            print("✅ 流程结束（Expiry 未立即变化，但也未报错）")
             return "OK", expiry_before, expiry_after
 
-        print("✅ 已提交续期（Expiry 可能稍后更新）")
-        return "OK", expiry_before, expiry_after
+    except Exception as e:
+        print(f"💥 发生严重异常: {e}")
+        traceback.print_exc()
+        # 这里的关键修复：返回一个由3个元素组成的元组，避免 main 函数解包失败
+        return "FAIL", expiry_before, str(e)
 
 
 def main():
-    accounts = build_accounts_from_env()
+    try:
+        accounts = build_accounts_from_env()
+    except Exception as e:
+        print(e)
+        return
+
     display = setup_xvfb()
 
     ok = fail = skip = 0
     not_yet = 0
-    tg_dests = set()  # (token, chat_id) 去重
+    tg_dests = set()
 
     try:
         for i, acc in enumerate(accounts, start=1):
@@ -307,70 +341,66 @@ def main():
             server_id = acc["server_id"]
             tg_token = (acc.get("tg_token") or "").strip()
             tg_chat = (acc.get("tg_chat") or "").strip()
+            
             if tg_token and tg_chat:
                 tg_dests.add((tg_token, tg_chat))
 
-            
-
             safe_email = mask_email_keep_domain(email)
             print("\n" + "=" * 70)
-            print(f"👤 [{i}/{len(accounts)}] 账号： {safe_email}")
+            print(f"👤 [{i}/{len(accounts)}] 账号： {safe_email} (ID: {server_id})")
             print("=" * 70)
 
-            try:
-                status, before, after = renew_one_account(email, password, server_id)
+            # 调用核心函数
+            status, before, after = renew_one_account(email, password, server_id)
 
-                if status == "SKIP":
-                    skip += 1
-                    now_utc = datetime.now(timezone.utc)
-                    open_utc = renew_open_utc_from_expiry(before)
-                    msg = (
-                        "ℹ️ Katabump 续期跳过（按 **UTC 0点** 规则：尚未到可续期开放时间）\n"
-                        f"账号：{safe_email}\n"
-                        f"Expiry：{before}\n"
-                        f"开放时间：{open_utc.strftime('%Y-%m-%d %H:%M')} UTC\n"
-                        f"当前时间：{now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
-                    )
-                   
-                elif status == "OK":
-                    ok += 1
-                    if after and after != before:
-                        msg = f"✅ Katabump 续期成功\n账号：{safe_email}\nExpiry：{before} ➜ {after}"
-                    else:
-                        msg = f"✅ Katabump 已提交续期（Expiry 可能稍后更新）\n账号：{safe_email}\nExpiry：{before}"
-                elif status == "OK_NOT_YET":
-                    not_yet += 1
-                    msg = (
-                        "ℹ️ Katabump 续期跳过（站点返回：未到可续期时间；以 UTC 0点 为基准）\n"
-                        f"账号：{safe_email}\n"
-                        f"Expiry：{before}\n"
-                        f"告警：{after}"
-                    )
+            # 处理结果
+            if status == "SKIP":
+                skip += 1
+                现在_utc = datetime.now(timezone.utc)
+                open_utc = renew_open_utc_from_expiry(before) if before else now_utc
+                msg = (
+                    "ℹ️ Katabump 续期跳过 (未到时间)\n"
+                    f"账号：{safe_email}\n"
+                    f"Expiry：{before}\n"
+                    f"开放时间：{open_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+                )
+            
+            elif status == "OK":
+                ok += 1
+                if after and after != before:
+                    msg = f"✅ Katabump 续期成功\n账号：{safe_email}\nExpiry：{before} ➜ {after}"
                 else:
-                    fail += 1
-                    msg = f"❌ Katabump 续期失败/疑似失败\n账号：{safe_email}\nExpiry：{before or '未知'}"
-
-                print(msg)
-                tg_send(msg, tg_token, tg_chat)
-
-            except Exception as e:
+                    msg = f"✅ Katabump 已提交续期 (日期未立即刷新)\n账号：{safe_email}\nExpiry：{before}"
+            
+            elif status == "OK_NOT_YET":
+                not_yet += 1
+                msg = (
+                    "ℹ️ Katabump 续期跳过 (网站提示未到期)\n"
+                    f"账号：{safe_email}\n"
+                    f"Expiry：{before}\n"
+                    f"提示：{after}"
+                )
+            
+            else: # FAIL
                 fail += 1
-                msg = f"❌ Katabump 脚本异常\n账号：{safe_email}\n错误：{e}"
-                print(msg)
-                tg_send(msg, tg_token, tg_chat)
+                msg = f"❌ Katabump 续期失败\n账号：{safe_email}\n当前Expiry：{before or '未知'}\n错误信息：{after}"
 
+            print(msg)
+            tg_send(msg, tg_token, tg_chat)
 
-            # 每个账号之间等待 5 秒，避免触发风控/频繁登录
+            # 账号间休息，避免封控
             if i < len(accounts):
+                print("⏳ 等待 5 秒切换下一个账号...")
                 time.sleep(5)
 
-        summary = f"📌 汇总：续期成功 {ok} / 已点按钮但未开放 {not_yet} / 跳过未点按钮 {skip} / 失败 {fail}"
-
+        summary = f"📌 汇总：续期成功 {ok} / 网站提示未到期 {not_yet} / 脚本跳过 {skip} / 失败 {fail}"
         print("\n" + summary)
-        if tg_dests:
-            for token, chat in sorted(tg_dests):
-                tg_send(summary, token, chat)
+        
+        for token, chat in sorted(tg_dests):
+            tg_send(summary, token, chat)
 
+    except KeyboardInterrupt:
+        print("\n🚫 用户中断")
     finally:
         if display:
             display.stop()
